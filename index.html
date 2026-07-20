@@ -59,6 +59,8 @@
   .pieceItem .ops button{padding:1px 6px; font-size:11px; border-radius:5px;}
 
   #playBtn{width:76px;}
+  .stateBtn{flex:1;}
+  .stateBtn.on{background:var(--accent); color:#111; border-color:var(--accent); font-weight:600;}
   #fStatus .fname{color:var(--accent2); font-size:12px;}
   input[type=file]{display:none;}
   #dropHint{position:absolute; inset:0; display:none; align-items:center; justify-content:center; background:rgba(255,255,255,.07); border:3px dashed var(--accent); font-size:20px; pointer-events:none; z-index:10;}
@@ -84,7 +86,12 @@
 
   <aside>
     <section>
-      <h2>Transform prompt</h2>
+      <h2>Transform (A → B)</h2>
+      <div class="row">
+        <button class="small stateBtn on" id="stateA">A · start</button>
+        <button class="small stateBtn" id="stateB">B · end</button>
+      </div>
+      <div class="hint" style="margin-top:0;margin-bottom:10px">Arrange pieces in A, then switch to B and rearrange them to set the end state. Play loops A → B → A forever. Or auto-fill B with a prompt:</div>
       <div class="row">
         <input type="text" id="fPrompt" placeholder='e.g. "transform into an arrow"'>
         <button id="fGo" class="primary small">Go</button>
@@ -97,7 +104,7 @@
         <button class="small" id="fShuffle" title="Re-assign pieces to different spots">↺ Remap</button>
         <button class="small" id="fClear">✕ Clear</button>
       </div>
-      <div class="hint">Loops forever: start layout → shape → back. Known shapes: arrow (add up/down/left), heart, star, circle, square, triangle, diamond, plus, x, moon, bolt. Anything else gets spelled out as letters.</div>
+      <div class="hint">Prompts run fully offline — no AI, no tokens. Known shapes: arrow (add up/down/left), heart, star, circle, square, triangle, diamond, plus, x, moon, bolt. Anything else gets spelled out as letters. After a prompt fills B, you can fine-tune it in B mode.</div>
     </section>
 
     <section>
@@ -168,6 +175,7 @@ const S = {
   formation:null,                 // {prompt, label}
   pieces:[],                      // {id,name,svgText,vb,inner,color,colInner,x,y,scale,rot,jit,tx,ty,trot,tscale}
   sel:new Set(), playing:true, frame:0,
+  editState:"A", forceMix:null,
 };
 let nextId = 1;
 let jit = {};        // id -> [[dx,dy,dr,ds] per jitter frame]
@@ -218,7 +226,7 @@ function transformAt(p, f){
   const j = (jit[p.id] && jit[p.id][f % S.frames]) || [0,0,0,1];
   let x=p.x, y=p.y, r=p.rot, s=p.scale;
   if(S.formation && p.tx!=null){
-    const m = mixAt(f);
+    const m = S.forceMix!=null ? S.forceMix : mixAt(f);
     x=lerp(x,p.tx,m); y=lerp(y,p.ty,m); r=lerp(r,p.trot,m); s=lerp(s,p.tscale,m);
   }
   return [x+j[0], y+j[1], r+j[2], s*j[3]];
@@ -367,7 +375,9 @@ function updateSelBox(){
   const gb = stage.querySelector("#selboxes");
   if(!gb) return;
   gb.innerHTML = "";
+  const k = PK();
   for(const p of selPieces()){
+    if(S.editState==="B") ensureB(p);
     const [,,vw,vh]=p.vb;
     const sb=document.createElementNS(SVGNS,"rect");
     sb.setAttribute("fill","none"); sb.setAttribute("stroke","#ffffff");
@@ -375,7 +385,7 @@ function updateSelBox(){
     sb.setAttribute("stroke-dasharray", `${S.w/120} ${S.w/180}`);
     sb.setAttribute("x",-vw/2-6); sb.setAttribute("y",-vh/2-6);
     sb.setAttribute("width",vw+12); sb.setAttribute("height",vh+12);
-    sb.setAttribute("transform", `translate(${p.x} ${p.y}) rotate(${p.rot}) scale(${p.scale})`);
+    sb.setAttribute("transform", `translate(${p[k.x]} ${p[k.y]}) rotate(${p[k.rot]}) scale(${p[k.scale]})`);
     gb.appendChild(sb);
   }
 }
@@ -388,10 +398,15 @@ function restartTimer(){
 }
 $("playBtn").onclick = ()=>{
   S.playing=!S.playing;
+  if(S.playing && S.editState==="B"){ S.editState="A"; S.forceMix=null; S.frame=0;
+    $("stateA").classList.add("on"); $("stateB").classList.remove("on"); syncSel(); }
   $("playBtn").textContent = S.playing?"Pause":"Play";
   restartTimer();
 };
-$("stepBtn").onclick = ()=>{ S.frame=(S.frame+1)%cycleFrames(); applyFrame(); };
+$("stepBtn").onclick = ()=>{
+  if(S.editState==="B"){ setEditState("A"); }
+  S.frame=(S.frame+1)%cycleFrames(); applyFrame();
+};
 
 /* ============================ Selection & drag ============================ */
 function svgPt(e){
@@ -405,7 +420,9 @@ function startDrag(e,p){
   if(!S.sel.has(p.id)){ select(p.id, e.shiftKey); }
   else if(e.shiftKey){ select(p.id, true); return; }   // shift-click on selected piece = deselect it
   const m = svgPt(e);
-  drag = {m0:m, starts:selPieces().map(q=>[q, q.x, q.y])};
+  const k = PK();
+  if(S.editState==="B") selPieces().forEach(ensureB);
+  drag = {m0:m, k, starts:selPieces().map(q=>[q, q[k.x], q[k.y]])};
   window.addEventListener("pointermove", onDrag);
   window.addEventListener("pointerup", endDrag);
 }
@@ -413,10 +430,33 @@ function onDrag(e){
   if(!drag) return;
   const m = svgPt(e);
   const dx=m.x-drag.m0.x, dy=m.y-drag.m0.y;
-  drag.starts.forEach(([q,x0,y0])=>{ q.x=x0+dx; q.y=y0+dy; });
+  drag.starts.forEach(([q,x0,y0])=>{ q[drag.k.x]=x0+dx; q[drag.k.y]=y0+dy; });
   applyFrame(); updateSelBox();
 }
 function endDrag(){ drag=null; window.removeEventListener("pointermove",onDrag); window.removeEventListener("pointerup",endDrag); }
+
+/* pose helpers: which fields do the editing tools touch? (A = start, B = end) */
+function PK(){ return S.editState==="B" ? {x:"tx",y:"ty",rot:"trot",scale:"tscale"} : {x:"x",y:"y",rot:"rot",scale:"scale"}; }
+function ensureB(p){ if(p.tx==null){ p.tx=p.x; p.ty=p.y; p.trot=p.rot; p.tscale=p.scale; } }
+function setEditState(st){
+  S.editState = st;
+  $("stateA").classList.toggle("on", st==="A");
+  $("stateB").classList.toggle("on", st==="B");
+  if(st==="B"){
+    S.pieces.forEach(ensureB);
+    if(!S.formation){
+      S.formation = {prompt:"", label:"A→B"};
+      $("fStatus").style.display=""; $("fName").textContent="→ A→B";
+    }
+    S.playing=false; $("playBtn").textContent="Play"; restartTimer();
+    S.forceMix = 1;
+  } else {
+    S.forceMix = null; S.frame = 0;
+  }
+  applyFrame(); syncSel();
+}
+$("stateA").onclick = ()=>setEditState("A");
+$("stateB").onclick = ()=>setEditState("B");
 
 function selPieces(){ return S.pieces.filter(p=>S.sel.has(p.id)); }
 function clearSel(){ S.sel.clear(); syncSel(); }
@@ -432,8 +472,10 @@ function syncSel(){
   $("pieceCtrl").style.display = ps.length?"":"none";
   const p = ps[0];
   if(p){
-    $("pScl").value=Math.round(p.scale*100); $("pSclV").textContent=Math.round(p.scale*100)+"%";
-    $("pRot").value=p.rot; $("pRotV").textContent=Math.round(p.rot)+"°";
+    const k = PK();
+    if(S.editState==="B") ensureB(p);
+    $("pScl").value=Math.round(p[k.scale]*100); $("pSclV").textContent=Math.round(p[k.scale]*100)+"%";
+    $("pRot").value=p[k.rot]; $("pRotV").textContent=Math.round(p[k.rot])+"°";
     $("pJit").value=p.jit*100; $("pJitV").textContent=Math.round(p.jit*100)+"%";
     if(p.color) $("pCol").value=p.color;
   }
@@ -449,10 +491,12 @@ document.addEventListener("keydown", e=>{
   if(!ps.length) return;
   const step = e.shiftKey?10:2;
   if(e.key==="Delete"||e.key==="Backspace"){ removeSelected(); e.preventDefault(); return; }
-  if(e.key==="ArrowLeft") ps.forEach(p=>p.x-=step);
-  else if(e.key==="ArrowRight") ps.forEach(p=>p.x+=step);
-  else if(e.key==="ArrowUp") ps.forEach(p=>p.y-=step);
-  else if(e.key==="ArrowDown") ps.forEach(p=>p.y+=step);
+  const k = PK();
+  if(S.editState==="B") ps.forEach(ensureB);
+  if(e.key==="ArrowLeft") ps.forEach(p=>p[k.x]-=step);
+  else if(e.key==="ArrowRight") ps.forEach(p=>p[k.x]+=step);
+  else if(e.key==="ArrowUp") ps.forEach(p=>p[k.y]-=step);
+  else if(e.key==="ArrowDown") ps.forEach(p=>p[k.y]+=step);
   else return;
   applyFrame(); updateSelBox(); e.preventDefault();
 });
@@ -516,9 +560,11 @@ $("fFit").addEventListener("change", e=>{ S.fit=e.target.checked; if(S.formation
 $("rerollBtn").onclick=()=>{ S.seed=1+Math.floor(Math.random()*99999); $("seedV").textContent=S.seed; computeJitter(); applyFrame(); };
 
 $("pScl").addEventListener("input", e=>{ const ps=selPieces(); if(!ps.length)return;
-  ps.forEach(p=>p.scale=e.target.value/100); $("pSclV").textContent=e.target.value+"%"; applyFrame(); updateSelBox(); });
+  const k=PK(); if(S.editState==="B") ps.forEach(ensureB);
+  ps.forEach(p=>p[k.scale]=e.target.value/100); $("pSclV").textContent=e.target.value+"%"; applyFrame(); updateSelBox(); });
 $("pRot").addEventListener("input", e=>{ const ps=selPieces(); if(!ps.length)return;
-  ps.forEach(p=>p.rot=+e.target.value); $("pRotV").textContent=e.target.value+"°"; applyFrame(); updateSelBox(); });
+  const k=PK(); if(S.editState==="B") ps.forEach(ensureB);
+  ps.forEach(p=>p[k.rot]=+e.target.value); $("pRotV").textContent=e.target.value+"°"; applyFrame(); updateSelBox(); });
 $("pJit").addEventListener("input", e=>{ const ps=selPieces(); if(!ps.length)return;
   ps.forEach(p=>p.jit=e.target.value/100); $("pJitV").textContent=e.target.value+"%"; computeJitter(); applyFrame(); });
 $("pCol").addEventListener("input", e=>{ selPieces().forEach(p=>setColor(p, e.target.value)); });
@@ -769,15 +815,17 @@ $("fShuffle").onclick=()=>{
   runFormation(S.formation.prompt, true);
 };
 $("fClear").onclick=()=>{
-  S.formation=null; S.frame=0;
+  S.formation=null; S.frame=0; S.forceMix=null; S.editState="A";
+  $("stateA").classList.add("on"); $("stateB").classList.remove("on");
   S.pieces.forEach(p=>{p.tx=p.ty=null;});
   $("fStatus").style.display="none";
-  applyFrame(); restartTimer();
+  applyFrame(); restartTimer(); syncSel();
 };
 
 /* ============================ Export animated SVG ============================ */
 function buildExport(){
   computeJitter();
+  const fm = S.forceMix; S.forceMix = null;   // export the full loop, not the editing preview
   const cyc = cycleFrames();
   const dur = (cyc/S.fps).toFixed(4);
   let css = `.jig{transform-box:view-box;transform-origin:0 0;animation-duration:${dur}s;animation-iteration-count:infinite;animation-timing-function:steps(1,end);}`;
@@ -797,6 +845,7 @@ function buildExport(){
     body += `<g id="jig${i}" class="jig"><svg viewBox="${p.vb.join(" ")}" x="${-vw/2}" y="${-vh/2}" width="${vw}" height="${vh}" overflow="visible"${p.color?` fill="${p.color}"`:""}>${curInner(p)}</svg></g>`;
   });
 
+  S.forceMix = fm;
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${S.w} ${S.h}" width="${S.w}" height="${S.h}">`
        + `<style>${css}</style>${body}</svg>`;
 }
@@ -833,12 +882,15 @@ function loadFrameImage(f){
 }
 async function renderAllFrames(onProgress){
   computeJitter();
+  const fm = S.forceMix; S.forceMix = null;   // export the full loop, not the editing preview
   const cyc = cycleFrames();
   const imgs = [];
-  for(let f=0; f<cyc; f++){
-    imgs.push(await loadFrameImage(f));
-    onProgress && onProgress(f+1, cyc);
-  }
+  try{
+    for(let f=0; f<cyc; f++){
+      imgs.push(await loadFrameImage(f));
+      onProgress && onProgress(f+1, cyc);
+    }
+  } finally { S.forceMix = fm; }
   return imgs;
 }
 let gifLibP = null;
