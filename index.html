@@ -74,7 +74,9 @@
   <div class="spacer"></div>
   <button id="addBtn">+ Add SVGs</button>
   <button id="sampleBtn">Load sample</button>
-  <button id="exportBtn" class="primary">Export animated SVG</button>
+  <button id="exportBtn" class="primary">Export SVG</button>
+  <button id="gifBtn">GIF</button>
+  <button id="mp4Btn">MP4</button>
 </header>
 
 <main>
@@ -135,6 +137,8 @@
       <h2>Canvas</h2>
       <div class="row"><label>Width</label><input type="number" id="cw" value="1080" min="64" max="4096"></div>
       <div class="row"><label>Height</label><input type="number" id="ch" value="1080" min="64" max="4096"></div>
+      <div class="row"><label class="toggle"><input type="checkbox" id="guidesChk" checked> Show 8×8 grid guides</label></div>
+      <div class="hint">Guides divide the canvas into an 8×8 grid (135×135&nbsp;px cells at 1080). Editor-only — never in exports.</div>
     </section>
 
     <section>
@@ -160,7 +164,7 @@ const S = {
   bgColor:"#cf3527", bgImage:null,
   fps:8, frames:8, seed:1234,
   jPos:10, jRot:2.5, jScl:2,
-  holdSec:1.2, travSec:1, fit:true,
+  holdSec:1.2, travSec:1, fit:true, guides:true,
   formation:null,                 // {prompt, label}
   pieces:[],                      // {id,name,svgText,vb,inner,color,colInner,x,y,scale,rot,jit,tx,ty,trot,tscale}
   sel:new Set(), playing:true, frame:0,
@@ -314,6 +318,26 @@ function buildScene(){
     els[p.id] = {g, nest};
     updatePieceContent(p);
   }
+
+  const gg = document.createElementNS(SVGNS,"g");
+  gg.setAttribute("id","guides");
+  gg.setAttribute("pointer-events","none");
+  for(let i=1; i<8; i++){
+    const v=document.createElementNS(SVGNS,"line");
+    v.setAttribute("x1",S.w/8*i); v.setAttribute("y1",0);
+    v.setAttribute("x2",S.w/8*i); v.setAttribute("y2",S.h);
+    const h=document.createElementNS(SVGNS,"line");
+    h.setAttribute("x1",0); h.setAttribute("y1",S.h/8*i);
+    h.setAttribute("x2",S.w); h.setAttribute("y2",S.h/8*i);
+    [v,h].forEach(l=>{
+      l.setAttribute("stroke","rgba(255,255,255,.4)");
+      l.setAttribute("stroke-width", Math.max(1, S.w/1080));
+      l.setAttribute("stroke-dasharray", `${S.w/180} ${S.w/270}`);
+      gg.appendChild(l);
+    });
+  }
+  gg.style.display = S.guides ? "" : "none";
+  stage.appendChild(gg);
 
   const gb = document.createElementNS(SVGNS,"g");
   gb.setAttribute("id","selboxes");
@@ -513,6 +537,10 @@ $("bgImgClear").onclick=()=>{ S.bgImage=null; $("bgImgClear").style.display="non
 
 $("cw").addEventListener("change", e=>{ S.w=Math.max(64,+e.target.value||1080); buildScene(); });
 $("ch").addEventListener("change", e=>{ S.h=Math.max(64,+e.target.value||1080); buildScene(); });
+$("guidesChk").addEventListener("change", e=>{
+  S.guides=e.target.checked;
+  const g=stage.querySelector("#guides"); if(g) g.style.display=S.guides?"":"none";
+});
 
 /* ============================ Upload ============================ */
 $("addBtn").onclick=()=>$("fileIn").click();
@@ -783,12 +811,121 @@ $("exportBtn").onclick=()=>{
   download("paper-motion.svg", buildExport(), "image/svg+xml");
 };
 
+/* ============================ GIF / MP4 export ============================ */
+function frameSVG(f){
+  let body = `<rect width="${S.w}" height="${S.h}" fill="${S.bgColor}"/>`;
+  if(S.bgImage) body += `<image width="${S.w}" height="${S.h}" preserveAspectRatio="xMidYMid slice" href="${S.bgImage}"/>`;
+  for(const p of S.pieces){
+    const [x,y,r,s] = transformAt(p,f);
+    const [,,vw,vh] = p.vb;
+    body += `<g transform="translate(${x} ${y}) rotate(${r}) scale(${s})"><svg viewBox="${p.vb.join(" ")}" x="${-vw/2}" y="${-vh/2}" width="${vw}" height="${vh}" overflow="visible"${p.color?` fill="${p.color}"`:""}>${curInner(p)}</svg></g>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${S.w} ${S.h}" width="${S.w}" height="${S.h}">${body}</svg>`;
+}
+function loadFrameImage(f){
+  return new Promise((res,rej)=>{
+    const img = new Image();
+    const url = URL.createObjectURL(new Blob([frameSVG(f)],{type:"image/svg+xml"}));
+    img.onload = ()=>{ URL.revokeObjectURL(url); res(img); };
+    img.onerror = ()=>{ URL.revokeObjectURL(url); rej(new Error("frame render failed")); };
+    img.src = url;
+  });
+}
+async function renderAllFrames(onProgress){
+  computeJitter();
+  const cyc = cycleFrames();
+  const imgs = [];
+  for(let f=0; f<cyc; f++){
+    imgs.push(await loadFrameImage(f));
+    onProgress && onProgress(f+1, cyc);
+  }
+  return imgs;
+}
+let gifLibP = null;
+function loadGifLib(){
+  if(window.GIF) return Promise.resolve();
+  if(!gifLibP) gifLibP = new Promise((res,rej)=>{
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js";
+    s.onload = res;
+    s.onerror = ()=>{ gifLibP=null; rej(new Error("couldn't load the GIF encoder — check your internet connection")); };
+    document.head.appendChild(s);
+  });
+  return gifLibP;
+}
+function saveBlob(name, blob){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+}
+$("gifBtn").onclick = async ()=>{
+  if(!S.pieces.length){ alert("Add some pieces first."); return; }
+  const btn = $("gifBtn"); btn.disabled = true;
+  try{
+    btn.textContent = "Loading…";
+    await loadGifLib();
+    const workerSrc = await (await fetch("https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js")).text();
+    const workerURL = URL.createObjectURL(new Blob([workerSrc],{type:"application/javascript"}));
+    const imgs = await renderAllFrames((i,n)=>btn.textContent=`Frames ${i}/${n}`);
+    const cnv = document.createElement("canvas"); cnv.width=S.w; cnv.height=S.h;
+    const ctx = cnv.getContext("2d");
+    const gif = new GIF({workers:2, quality:8, width:S.w, height:S.h, workerScript:workerURL});
+    imgs.forEach(img=>{
+      ctx.clearRect(0,0,S.w,S.h); ctx.drawImage(img,0,0,S.w,S.h);
+      gif.addFrame(ctx, {copy:true, delay:Math.round(1000/S.fps)});
+    });
+    gif.on("progress", p=>btn.textContent=`Encoding ${(p*100)|0}%`);
+    await new Promise(res=>{
+      gif.on("finished", blob=>{ saveBlob("paper-motion.gif", blob); res(); });
+      gif.render();
+    });
+    URL.revokeObjectURL(workerURL);
+  }catch(err){ alert("GIF export failed: "+err.message); }
+  btn.disabled = false; btn.textContent = "GIF";
+};
+$("mp4Btn").onclick = async ()=>{
+  if(!S.pieces.length){ alert("Add some pieces first."); return; }
+  const btn = $("mp4Btn"); btn.disabled = true;
+  try{
+    if(!("MediaRecorder" in window)) throw new Error("video recording isn't supported in this browser");
+    const imgs = await renderAllFrames((i,n)=>btn.textContent=`Frames ${i}/${n}`);
+    const cnv = document.createElement("canvas"); cnv.width=S.w; cnv.height=S.h;
+    const ctx = cnv.getContext("2d");
+    ctx.drawImage(imgs[0],0,0);
+    const stream = cnv.captureStream(S.fps);
+    let mime="video/mp4", ext="mp4";
+    if(!MediaRecorder.isTypeSupported(mime)){
+      ext="webm";
+      mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
+    }
+    const rec = new MediaRecorder(stream, {mimeType:mime, videoBitsPerSecond:8000000});
+    const chunks = [];
+    rec.ondataavailable = e=>{ if(e.data.size) chunks.push(e.data); };
+    const stopped = new Promise(res=>rec.onstop=res);
+    rec.start();
+    const cyc = cycleFrames(), total = cyc*2;   // record two loops in real time
+    await new Promise(res=>{
+      let f = 0;
+      const iv = setInterval(()=>{
+        ctx.clearRect(0,0,S.w,S.h); ctx.drawImage(imgs[f%cyc],0,0);
+        btn.textContent = `Recording ${f+1}/${total}`;
+        if(++f >= total){ clearInterval(iv); res(); }
+      }, 1000/S.fps);
+    });
+    rec.stop(); await stopped;
+    saveBlob("paper-motion."+ext, new Blob(chunks,{type:mime}));
+    if(ext==="webm") alert("This browser can't record MP4 directly, so you got a WebM instead — same quality, and any online converter can turn it into MP4.");
+  }catch(err){ alert("Video export failed: "+err.message); }
+  btn.disabled = false; btn.textContent = "MP4";
+};
+
 /* ============================ Save / load project ============================ */
 $("saveBtn").onclick=()=>{
   const data = {
     v:2, w:S.w, h:S.h, bgColor:S.bgColor, bgImage:S.bgImage,
     fps:S.fps, frames:S.frames, seed:S.seed, jPos:S.jPos, jRot:S.jRot, jScl:S.jScl,
-    holdSec:S.holdSec, travSec:S.travSec, fit:S.fit, formation:S.formation,
+    holdSec:S.holdSec, travSec:S.travSec, fit:S.fit, guides:S.guides, formation:S.formation,
     pieces: S.pieces.map(p=>({name:p.name, svgText:p.svgText, color:p.color,
       x:p.x, y:p.y, scale:p.scale, rot:p.rot, jit:p.jit,
       tx:p.tx, ty:p.ty, trot:p.trot, tscale:p.tscale}))
@@ -802,7 +939,7 @@ $("projIn").addEventListener("change", async e=>{
     const d = JSON.parse(await f.text());
     Object.assign(S,{w:d.w,h:d.h,bgColor:d.bgColor,bgImage:d.bgImage,fps:d.fps,frames:d.frames,
       seed:d.seed,jPos:d.jPos,jRot:d.jRot,jScl:d.jScl,
-      holdSec:d.holdSec??1.2,travSec:d.travSec??1,fit:d.fit??true,formation:d.formation??null,
+      holdSec:d.holdSec??1.2,travSec:d.travSec??1,fit:d.fit??true,guides:d.guides??true,formation:d.formation??null,
       pieces:[],sel:new Set(),frame:0});
     d.pieces.forEach(p=>addPiece(p.name,p.svgText,p));
     $("cw").value=S.w; $("ch").value=S.h; $("bgColor").value=S.bgColor;
@@ -812,6 +949,7 @@ $("projIn").addEventListener("change", async e=>{
       .forEach(([id,v,u])=>{ $(id).value=v; $(id+"V").textContent=v+u; });
     $("seedV").textContent=S.seed;
     $("fFit").checked=S.fit;
+    $("guidesChk").checked=S.guides;
     if(S.formation){ $("fStatus").style.display=""; $("fName").textContent="→ "+S.formation.label; $("fPrompt").value=S.formation.prompt; }
     else $("fStatus").style.display="none";
     buildScene(); restartTimer();
